@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Skemer
+Comment=Check for Veldmuis and Flatpak updates
+Exec=skemer --tray
+Icon=skemer
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
