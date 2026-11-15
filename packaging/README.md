@@ -1,6 +1,8 @@
 # Packaging Notes
 
-Skemer is delivered as a separate signed release tarball, like `muis`.
+Skemer is delivered as a separate signed release tarball, like `muis`. The
+end-to-end release process, verification, and key rotation are in
+[`../docs/release.md`](../docs/release.md).
 
 ## Release Tarball
 

@@ -9,11 +9,12 @@ separate, user-run source.
 
 ## Status
 
-The scaffold, the system and Flatpak sources, the streaming apply path, and the
-tray lifecycle are in place. The tray process owns periodic checks,
-notifications, and autostart; the window runs in a short-lived `skemer --window`
-child so closing it releases WebKitGTK. Packaging and release are next. The
-design is in [`docs/design.md`](docs/design.md); the UI reference is
+The scaffold, the system and Flatpak sources, the streaming apply path, the tray
+lifecycle, and the signed release pipeline are in place. The tray process owns
+periodic checks, notifications, and autostart; the window runs in a short-lived
+`skemer --window` child so closing it releases WebKitGTK. The design is in
+[`docs/design.md`](docs/design.md), the release process in
+[`docs/release.md`](docs/release.md), and the UI reference is
 [`docs/mockup.html`](docs/mockup.html).
 
 ## Shape
