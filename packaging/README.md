@@ -31,6 +31,11 @@ refuses a tag that does not match it.
 
 The Skemer release key is separate from muis and Veldmuis. See
 [`keys/README.md`](keys/README.md) for creation, verification, and rotation.
+For a guided setup, run `packaging/setup-release-key.sh` from a terminal; it
+writes the public files into both checkouts, exports the secret material
+outside the repositories, and optionally sets the GitHub secrets without
+committing anything.
+
 The release job fails with a clear message until `keys/skemer-release.gpg`,
 `keys/skemer-release.asc`, and `keys/skemer-trusted` exist and the
 `SKEMER_GPG_PRIVATE_KEY`, `SKEMER_GPG_PASSPHRASE`, and `SKEMER_GPG_FPR` secrets

@@ -18,6 +18,12 @@ The release workflow expects these files before it will publish:
 They are not generated automatically. Create them once, verify them, and commit
 only the public material.
 
+For a guided setup, run `packaging/setup-release-key.sh` from a terminal. It
+generates or reuses the key, writes the public files into the Skemer and
+Veldmuis checkouts, exports the secret material outside both repositories, and
+optionally sets the GitHub release environment secrets. It never commits or
+pushes.
+
 ## Create the key
 
 Run this on a trusted machine, not in CI:
