@@ -18,9 +18,11 @@ import {
   type UpdateSource,
 } from "./types";
 
+type ActiveTab = "system" | "flatpak";
+
 interface State {
   plan: UpdatePlan | null;
-  active: UpdateSource;
+  active: ActiveTab;
   selected: Set<UpdateSource>;
   detail: string | null;
   settings: Settings;
@@ -75,13 +77,63 @@ function itemsFor(source: UpdateSource): UpdateItem[] {
   return state.plan.items.filter((item) => item.source === source);
 }
 
+function itemsForTab(tab: ActiveTab): UpdateItem[] {
+  if (!state.plan) return [];
+  if (tab === "system") {
+    return state.plan.items.filter((item) => item.source === "system");
+  }
+  return state.plan.items.filter(
+    (item) => item.source === "flatpak-system" || item.source === "flatpak-user",
+  );
+}
+
+function flatpakItems(source: "flatpak-system" | "flatpak-user"): UpdateItem[] {
+  return itemsFor(source);
+}
+
+function tabCount(tab: ActiveTab): number {
+  return itemsForTab(tab).length;
+}
+
 function sourceCount(source: UpdateSource): number {
   return itemsFor(source).length;
 }
 
 function currentDetail(): UpdateItem | undefined {
-  const items = state.plan?.items ?? [];
-  return items.find((item) => item.id === state.detail) ?? itemsFor(state.active)[0];
+  const items = itemsForTab(state.active);
+  return items.find((item) => item.id === state.detail) ?? items[0];
+}
+
+function applySettingsToSelection(settings: Settings): void {
+  if (settings.include_flatpak_system) state.selected.add("flatpak-system");
+  else state.selected.delete("flatpak-system");
+  if (settings.include_flatpak_user) state.selected.add("flatpak-user");
+  else state.selected.delete("flatpak-user");
+}
+
+function rowHtml(item: UpdateItem, detail: UpdateItem | undefined): string {
+  return `
+    <button class="row ${detail?.id === item.id ? "selected" : ""}" data-detail="${escapeHtml(item.id)}">
+      <span class="pkg">
+        <span class="badge">${escapeHtml(item.repo)}</span>
+        <span class="pkg-name">${escapeHtml(item.name)}</span>
+        <span class="pkg-summary">${escapeHtml(item.summary)}</span>
+      </span>
+      <span class="ver"><span>${escapeHtml(item.current_version)}</span><span class="arrow">→</span><span class="new">${escapeHtml(item.new_version)}</span></span>
+      <span class="size">${formatBytes(item.download_bytes)}</span>
+    </button>`;
+}
+
+function flatpakGroup(
+  source: "flatpak-system" | "flatpak-user",
+  label: string,
+  detail: UpdateItem | undefined,
+): string {
+  const items = flatpakItems(source);
+  if (items.length === 0) return "";
+  return `
+    <div class="group-head">${label} <span class="count-pill">${items.length}</span></div>
+    ${items.map((item) => rowHtml(item, detail)).join("")}`;
 }
 
 let renderQueued = false;
@@ -163,46 +215,58 @@ function render(): void {
       </section>
 
       <nav class="tabs ${state.applying ? "hidden" : ""}">
-        ${(["system", "flatpak-system", "flatpak-user"] as UpdateSource[])
-          .map(
-            (source) => `
-              <button class="tab ${state.active === source ? "active" : ""}" data-source="${source}">
-                ${sourceLabel(source)} <span class="count-pill">${sourceCount(source)}</span>
-              </button>`,
-          )
-          .join("")}
+        <button class="tab ${state.active === "system" ? "active" : ""}" data-tab="system">
+          System <span class="count-pill">${tabCount("system")}</span>
+        </button>
+        <button class="tab ${state.active === "flatpak" ? "active" : ""}" data-tab="flatpak">
+          Flatpak <span class="count-pill">${tabCount("flatpak")}</span>
+        </button>
       </nav>
 
       <section class="workspace ${state.applying ? "hidden" : ""}">
         <div class="panel list-panel">
-          <div class="list-head">
-            <label class="source-toggle">
-              <input type="checkbox" data-toggle-source="${state.active}" ${state.selected.has(state.active) ? "checked" : ""}>
-              Include ${sourceLabel(state.active)}
-            </label>
-            <span>Version</span>
-            <span class="right">Size</span>
-          </div>
-          <div class="list">
-            ${
-              itemsFor(state.active).length === 0
-                ? `<div class="empty"><strong>Nothing to update</strong>This source is up to date.</div>`
-                : itemsFor(state.active)
-                    .map(
-                      (item) => `
-                        <button class="row ${detail?.id === item.id ? "selected" : ""}" data-detail="${escapeHtml(item.id)}">
-                          <span class="pkg">
-                            <span class="badge">${escapeHtml(item.repo)}</span>
-                            <span class="pkg-name">${escapeHtml(item.name)}</span>
-                            <span class="pkg-summary">${escapeHtml(item.summary)}</span>
-                          </span>
-                          <span class="ver"><span>${escapeHtml(item.current_version)}</span><span class="arrow">→</span><span class="new">${escapeHtml(item.new_version)}</span></span>
-                          <span class="size">${formatBytes(item.download_bytes)}</span>
-                        </button>`,
-                    )
-                    .join("")
-            }
-          </div>
+          ${
+            state.active === "system"
+              ? `
+                <div class="list-head">
+                  <label class="source-toggle">
+                    <input type="checkbox" data-toggle-source="system" ${state.selected.has("system") ? "checked" : ""}>
+                    Include System
+                  </label>
+                  <span>Version</span>
+                  <span class="right">Size</span>
+                </div>
+                <div class="list">
+                  ${
+                    itemsForTab("system").length === 0
+                      ? `<div class="empty"><strong>Nothing to update</strong>The system is up to date.</div>`
+                      : itemsForTab("system")
+                          .map((item) => rowHtml(item, detail))
+                          .join("")
+                  }
+                </div>`
+              : `
+                <div class="list-head flatpak-head">
+                  <div class="source-toggles">
+                    <label class="source-toggle">
+                      <input type="checkbox" data-toggle-source="flatpak-system" ${state.selected.has("flatpak-system") ? "checked" : ""}> System
+                    </label>
+                    <label class="source-toggle">
+                      <input type="checkbox" data-toggle-source="flatpak-user" ${state.selected.has("flatpak-user") ? "checked" : ""}> User
+                    </label>
+                  </div>
+                  <span>Version</span>
+                  <span class="right">Size</span>
+                </div>
+                <div class="list">
+                  ${
+                    itemsForTab("flatpak").length === 0
+                      ? `<div class="empty"><strong>Nothing to update</strong>Flatpak is up to date.</div>`
+                      : flatpakGroup("flatpak-system", "System", detail) +
+                        flatpakGroup("flatpak-user", "User", detail)
+                  }
+                </div>`
+          }
         </div>
 
         <aside class="panel details">
@@ -287,9 +351,9 @@ function wire(): void {
   });
   document.querySelector("#settings-save")?.addEventListener("click", () => void saveSettingsFromForm());
 
-  document.querySelectorAll<HTMLElement>("[data-source]").forEach((element) => {
+  document.querySelectorAll<HTMLElement>("[data-tab]").forEach((element) => {
     element.addEventListener("click", () => {
-      state.active = element.dataset.source as UpdateSource;
+      state.active = element.dataset.tab as ActiveTab;
       state.detail = null;
       render();
     });
@@ -379,7 +443,8 @@ async function subscribeToUpdates(): Promise<void> {
   const { listen } = await import("@tauri-apps/api/event");
   await listen<{ percent: number; message: string }>("skemer://update-progress", (event) => {
     const percent = Number(event.payload.percent);
-    state.progress = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+    const next = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+    state.progress = Math.max(state.progress, next);
     state.progressMessage = event.payload.message;
     scheduleRender();
   });
@@ -411,7 +476,9 @@ async function saveSettingsFromForm(): Promise<void> {
 
   try {
     await saveSettings(state.settings);
+    applySettingsToSelection(state.settings);
     state.settingsOpen = false;
+    await refresh();
   } catch (error) {
     state.error = String(error);
   }
@@ -424,6 +491,7 @@ void (async () => {
   } catch (error) {
     state.error = String(error);
   }
+  applySettingsToSelection(state.settings);
   try {
     await subscribeToUpdates();
   } catch (error) {

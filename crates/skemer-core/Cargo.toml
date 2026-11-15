@@ -9,5 +9,6 @@ description = "Skemer update models, settings, and plan helpers"
 
 [dependencies]
 anyhow.workspace = true
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true

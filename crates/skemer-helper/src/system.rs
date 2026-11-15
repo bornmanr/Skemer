@@ -2,15 +2,14 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use alpm::{Alpm, SigLevel, TransFlag};
 use anyhow::{Context, Result};
 use skemer_core::models::{
     ApplyOutcome, ApplyRequest, HoldDecision, UpdateItem, UpdatePlan, UpdateSource,
 };
-use skemer_core::{pacman_conf, plan};
+use skemer_core::sources::FlatpakScope;
+use skemer_core::{pacman_conf, plan, CancelHandle};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -75,48 +74,6 @@ pub fn prepare(holds: &[String]) -> Result<HoldDecision> {
     handle.prepare_with(holds)
 }
 
-/// One update can be cancelled at a time.
-#[derive(Clone, Default)]
-pub struct CancelHandle {
-    cancelled: Arc<AtomicBool>,
-    pid: Arc<Mutex<Option<u32>>>,
-}
-
-impl CancelHandle {
-    /// Ask pacman to stop. SIGINT lets pacman release its transaction and the
-    /// pacman database lock cleanly. The signal goes to the child's process
-    /// group so helper processes stop too.
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-        let Ok(pid) = self.pid.lock() else {
-            return;
-        };
-        let Some(pid) = *pid else {
-            return;
-        };
-        if pid == 0 {
-            return;
-        }
-        let pid = pid as i32;
-        // The group signal is the important one; the direct signal covers a
-        // child that did not get its own process group.
-        unsafe {
-            libc::kill(pid, libc::SIGINT);
-            libc::kill(-pid, libc::SIGINT);
-        }
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-
-    fn set_pid(&self, pid: Option<u32>) {
-        if let Ok(mut current) = self.pid.lock() {
-            *current = pid;
-        }
-    }
-}
-
 /// Progress and log events from a running apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyEvent {
@@ -124,57 +81,45 @@ pub enum ApplyEvent {
     Log(String),
 }
 
-/// Run `pacman -Syu`, streaming progress and log lines through `events`.
-///
-/// Holds are assumed to have been validated by the caller. `reboot_suggested`
-/// is computed before the transaction starts so a kernel update is still
-/// visible after pacman has replaced the running modules.
-pub async fn apply_streaming(
-    request: &ApplyRequest,
-    reboot_suggested: bool,
-    pacman: &str,
+struct ChildOutcome {
+    success: bool,
+    cancelled: bool,
+    percent: u32,
+    log: String,
+    error: Option<String>,
+}
+
+/// Run a child process, forwarding each line as a log event and letting the
+/// caller turn selected lines into progress events.
+async fn run_child<F>(
+    mut command: tokio::process::Command,
+    label: &str,
+    start_percent: u32,
+    mut classify: F,
     events: mpsc::Sender<ApplyEvent>,
     cancel: CancelHandle,
-) -> Result<ApplyOutcome> {
-    if request
-        .sources
-        .iter()
-        .any(|source| *source != UpdateSource::System)
-    {
-        anyhow::bail!("Flatpak updates are not available yet");
-    }
-
-    if !request.sources.contains(&UpdateSource::System) {
-        return Ok(empty_outcome());
-    }
-
-    let holds = normalized_holds(&request.holds);
-    emit(
-        &events,
-        ApplyEvent::Progress {
-            percent: 0,
-            message: "Preparing transaction".to_string(),
-        },
-    )
-    .await;
-
-    let mut command = tokio::process::Command::new(pacman);
+) -> Result<ChildOutcome>
+where
+    F: FnMut(&str, u32) -> Option<(u32, String)>,
+{
     command
-        .arg("-Syu")
-        .arg("--noconfirm")
-        .arg("--color")
-        .arg("never")
-        .env("LC_ALL", "C")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    if !holds.is_empty() {
-        command.arg("--ignore").arg(holds.join(","));
-    }
 
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("run {pacman} -Syu"))?;
+    let mut attempts = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 5 => {
+                // A freshly written test helper (or a pacman binary being
+                // replaced) can be briefly busy. Retry for a short moment.
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error).with_context(|| format!("run {label}")),
+        }
+    };
     cancel.set_pid(child.id());
     if cancel.is_cancelled() {
         cancel.cancel();
@@ -208,7 +153,7 @@ pub async fn apply_streaming(
     let wait = tokio::spawn(async move { child.wait().await });
 
     let mut log_tail: VecDeque<String> = VecDeque::with_capacity(200);
-    let mut percent = 0u32;
+    let mut percent = start_percent;
     while let Some(line) = line_rx.recv().await {
         let line = line.trim_end().to_string();
         if line.is_empty() {
@@ -216,16 +161,9 @@ pub async fn apply_streaming(
         }
         let _ = events.send(ApplyEvent::Log(line.clone())).await;
 
-        if let Some((new_percent, message)) = plan::parse_progress(&line) {
+        if let Some((new_percent, message)) = classify(&line, percent) {
             percent = new_percent;
             let _ = events.send(ApplyEvent::Progress { percent, message }).await;
-        } else if let Some(message) = line.strip_prefix(":: ") {
-            let _ = events
-                .send(ApplyEvent::Progress {
-                    percent,
-                    message: message.to_string(),
-                })
-                .await;
         }
 
         if log_tail.len() == 200 {
@@ -234,52 +172,252 @@ pub async fn apply_streaming(
         log_tail.push_back(line);
     }
 
-    let status = wait.await.context("join the pacman wait task")??;
-    // A cancel that arrives after pacman has already succeeded should not turn
-    // a completed update into a cancelled one.
+    let status = wait.await.context("join the child wait task")??;
     let cancelled = cancel.is_cancelled() && !status.success();
     cancel.set_pid(None);
 
     let log = log_tail.into_iter().collect::<Vec<_>>().join("\n");
     let success = status.success() && !cancelled;
-
-    let (error, candidates) = if success {
-        (None, Vec::new())
+    let error = if success {
+        None
     } else if cancelled {
-        (Some("Update cancelled.".to_string()), Vec::new())
+        Some("Update cancelled.".to_string())
     } else {
-        (
-            Some(failure_message(&log)),
-            plan::hold_candidates_from_error(&log),
-        )
+        Some(plan::failure_message(&log))
     };
 
+    Ok(ChildOutcome {
+        success,
+        cancelled,
+        percent,
+        log,
+        error,
+    })
+}
+
+fn pacman_progress(line: &str, percent: u32) -> Option<(u32, String)> {
+    if let Some((new_percent, message)) = plan::parse_progress(line) {
+        Some((new_percent, message))
+    } else {
+        line.strip_prefix(":: ")
+            .map(|message| (percent, message.to_string()))
+    }
+}
+
+async fn apply_system(
+    request: &ApplyRequest,
+    reboot_suggested: bool,
+    pacman: &str,
+    events: mpsc::Sender<ApplyEvent>,
+    cancel: CancelHandle,
+) -> Result<ApplyOutcome> {
+    let holds = normalized_holds(&request.holds);
+    emit(
+        &events,
+        ApplyEvent::Progress {
+            percent: 0,
+            message: "Preparing transaction".to_string(),
+        },
+    )
+    .await;
+
+    let mut command = tokio::process::Command::new(pacman);
+    command
+        .arg("-Syu")
+        .arg("--noconfirm")
+        .arg("--color")
+        .arg("never")
+        .env("LC_ALL", "C");
+    if !holds.is_empty() {
+        command.arg("--ignore").arg(holds.join(","));
+    }
+
+    let outcome = run_child(
+        command,
+        &format!("{pacman} -Syu"),
+        0,
+        pacman_progress,
+        events.clone(),
+        cancel,
+    )
+    .await?;
+
+    let candidates = if outcome.success || outcome.cancelled {
+        Vec::new()
+    } else {
+        plan::hold_candidates_from_error(&outcome.log)
+    };
+    let message = if outcome.success {
+        "System updated"
+    } else if outcome.cancelled {
+        "Update cancelled"
+    } else {
+        "Update failed"
+    };
     let _ = events
         .send(ApplyEvent::Progress {
-            percent: if success { 100 } else { percent },
-            message: if success {
-                "Update complete".to_string()
-            } else if cancelled {
-                "Update cancelled".to_string()
-            } else {
-                "Update failed".to_string()
-            },
+            percent: if outcome.success { 90 } else { outcome.percent },
+            message: message.to_string(),
         })
         .await;
 
     Ok(ApplyOutcome {
-        success,
-        cancelled,
+        success: outcome.success,
+        cancelled: outcome.cancelled,
         held_packages: holds,
         reboot_suggested,
-        log_tail: log,
-        error,
+        log_tail: outcome.log,
+        error: outcome.error,
         candidates,
+    })
+}
+
+async fn apply_flatpak(
+    scope: FlatpakScope,
+    flatpak: &str,
+    start_percent: u32,
+    events: mpsc::Sender<ApplyEvent>,
+    cancel: CancelHandle,
+) -> Result<ApplyOutcome> {
+    let label = scope.source().label();
+    let mut command = tokio::process::Command::new(flatpak);
+    command
+        .arg(scope.flag())
+        .arg("update")
+        .arg("-y")
+        .arg("--noninteractive")
+        .env("LC_ALL", "C");
+
+    let start = start_percent;
+    let outcome = run_child(
+        command,
+        &format!("{flatpak} {} update", scope.flag()),
+        start_percent,
+        move |line: &str, percent| {
+            if line.starts_with("Updating ") || line.starts_with("Looking for updates") {
+                Some((percent.max(start), line.trim().to_string()))
+            } else {
+                None
+            }
+        },
+        events.clone(),
+        cancel,
+    )
+    .await?;
+
+    let message = if outcome.success {
+        format!("{label} updated")
+    } else if outcome.cancelled {
+        "Update cancelled".to_string()
+    } else {
+        "Update failed".to_string()
+    };
+    let _ = events
+        .send(ApplyEvent::Progress {
+            percent: if outcome.success { 95 } else { outcome.percent },
+            message,
+        })
+        .await;
+
+    Ok(ApplyOutcome {
+        success: outcome.success,
+        cancelled: outcome.cancelled,
+        held_packages: Vec::new(),
+        reboot_suggested: false,
+        log_tail: outcome.log,
+        error: outcome.error,
+        candidates: Vec::new(),
+    })
+}
+
+/// Run the selected helper-side sources: the system, then Flatpak system.
+/// Flatpak user updates run in the user session and are rejected here.
+pub async fn apply_streaming(
+    request: &ApplyRequest,
+    reboot_suggested: bool,
+    pacman: &str,
+    flatpak: &str,
+    events: mpsc::Sender<ApplyEvent>,
+    cancel: CancelHandle,
+) -> Result<ApplyOutcome> {
+    if request.sources.contains(&UpdateSource::FlatpakUser) {
+        anyhow::bail!("Flatpak user updates run in the user session");
+    }
+    if request.sources.is_empty() {
+        return Ok(empty_outcome());
+    }
+
+    let system_selected = request.sources.contains(&UpdateSource::System);
+    let flatpak_selected = request.sources.contains(&UpdateSource::FlatpakSystem);
+    let mut log = String::new();
+    let mut held_packages = Vec::new();
+    let mut reboot_suggested = reboot_suggested;
+
+    if system_selected {
+        let outcome = apply_system(
+            request,
+            reboot_suggested,
+            pacman,
+            events.clone(),
+            cancel.clone(),
+        )
+        .await?;
+        if !outcome.success {
+            return Ok(outcome);
+        }
+        log = outcome.log_tail;
+        held_packages = outcome.held_packages;
+        reboot_suggested = outcome.reboot_suggested;
+    }
+
+    if flatpak_selected {
+        let start = if system_selected { 90 } else { 50 };
+        let outcome =
+            apply_flatpak(FlatpakScope::System, flatpak, start, events.clone(), cancel).await?;
+        log = combine_logs(log, outcome.log_tail);
+        if !outcome.success {
+            return Ok(ApplyOutcome {
+                success: false,
+                cancelled: outcome.cancelled,
+                held_packages,
+                reboot_suggested,
+                log_tail: log,
+                error: outcome.error,
+                candidates: Vec::new(),
+            });
+        }
+    }
+
+    let _ = events
+        .send(ApplyEvent::Progress {
+            percent: 100,
+            message: "Update complete".to_string(),
+        })
+        .await;
+
+    Ok(ApplyOutcome {
+        success: true,
+        cancelled: false,
+        held_packages,
+        reboot_suggested,
+        log_tail: log,
+        error: None,
+        candidates: Vec::new(),
     })
 }
 
 async fn emit(events: &mpsc::Sender<ApplyEvent>, event: ApplyEvent) {
     let _ = events.send(event).await;
+}
+
+fn combine_logs(first: String, second: String) -> String {
+    if first.is_empty() {
+        second
+    } else if second.is_empty() {
+        first
+    } else {
+        format!("{first}\n{second}")
+    }
 }
 
 fn empty_outcome() -> ApplyOutcome {
@@ -496,22 +634,11 @@ fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn failure_message(log: &str) -> String {
-    log.lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| {
-            let line = line.to_ascii_lowercase();
-            line.contains("error:") || line.contains("failed")
-        })
-        .unwrap_or("pacman -Syu failed")
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn holds_are_trimmed_sorted_and_deduplicated() {
@@ -529,7 +656,10 @@ mod tests {
     #[test]
     fn failure_message_prefers_the_last_error_line() {
         let log = "warning: something\nsome error: first\nerror: failed to commit transaction";
-        assert_eq!(failure_message(log), "error: failed to commit transaction");
+        assert_eq!(
+            plan::failure_message(log),
+            "error: failed to commit transaction"
+        );
     }
 
     #[tokio::test]
@@ -542,11 +672,12 @@ mod tests {
              exit 0\n",
         );
         let (tx, mut rx) = mpsc::channel(64);
-        let request = request(&[]);
+        let request = request(&[UpdateSource::System], &[]);
         let outcome = apply_streaming(
             &request,
             true,
             script.to_str().expect("script path"),
+            "/bin/true",
             tx,
             CancelHandle::default(),
         )
@@ -578,11 +709,12 @@ mod tests {
              exit 1\n",
         );
         let (tx, mut rx) = mpsc::channel(64);
-        let request = request(&[]);
+        let request = request(&[UpdateSource::System], &[]);
         let outcome = apply_streaming(
             &request,
             false,
             script.to_str().expect("script path"),
+            "/bin/true",
             tx,
             CancelHandle::default(),
         )
@@ -611,11 +743,11 @@ mod tests {
              sleep 5\n",
         );
         let (tx, mut rx) = mpsc::channel(64);
-        let request = request(&[]);
+        let request = request(&[UpdateSource::System], &[]);
         let cancel = CancelHandle::default();
         let canceller = cancel.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             canceller.cancel();
         });
 
@@ -623,6 +755,7 @@ mod tests {
             &request,
             false,
             script.to_str().expect("script path"),
+            "/bin/true",
             tx,
             cancel,
         )
@@ -635,39 +768,77 @@ mod tests {
         assert_eq!(outcome.error.as_deref(), Some("Update cancelled."));
     }
 
-    fn request(holds: &[&str]) -> ApplyRequest {
-        ApplyRequest {
-            sources: vec![UpdateSource::System],
-            holds: holds.iter().map(|hold| hold.to_string()).collect(),
-        }
+    #[tokio::test]
+    async fn flatpak_system_apply_streams_logs() {
+        let script = fake_flatpak(
+            "#!/bin/sh\n\
+             echo 'Looking for updates...'\n\
+             echo 'Updating org.gimp.GIMP'\n\
+             echo 'Updating org.freedesktop.Platform'\n\
+             exit 0\n",
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = request(&[UpdateSource::FlatpakSystem], &[]);
+        let outcome = apply_streaming(
+            &request,
+            false,
+            "/bin/true",
+            script.to_str().expect("script path"),
+            tx,
+            CancelHandle::default(),
+        )
+        .await
+        .expect("apply");
+        let events = drain(&mut rx).await;
+
+        assert!(outcome.success);
+        assert!(outcome.log_tail.contains("Updating org.gimp.GIMP"));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ApplyEvent::Progress { percent: 95, .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ApplyEvent::Progress { percent: 100, .. })));
     }
 
-    async fn drain(rx: &mut mpsc::Receiver<ApplyEvent>) -> Vec<ApplyEvent> {
-        let mut events = Vec::new();
-        while let Some(event) = rx.recv().await {
-            events.push(event);
-        }
-        events
+    #[tokio::test]
+    async fn mixed_apply_runs_system_then_flatpak() {
+        let pacman = fake_pacman("#!/bin/sh\necho 'system line'\nexit 0\n");
+        let flatpak = fake_flatpak("#!/bin/sh\necho 'flatpak line'\nexit 0\n");
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = request(&[UpdateSource::System, UpdateSource::FlatpakSystem], &[]);
+        let outcome = apply_streaming(
+            &request,
+            false,
+            pacman.to_str().expect("pacman path"),
+            flatpak.to_str().expect("flatpak path"),
+            tx,
+            CancelHandle::default(),
+        )
+        .await
+        .expect("apply");
+        let _ = drain(&mut rx).await;
+
+        assert!(outcome.success);
+        let system = outcome.log_tail.find("system line").expect("system log");
+        let flatpak = outcome.log_tail.find("flatpak line").expect("flatpak log");
+        assert!(system < flatpak);
     }
 
-    fn fake_pacman(body: &str) -> PathBuf {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let directory =
-            std::env::temp_dir().join(format!("skemer-pacman-{}-{id}", std::process::id()));
-        fs::create_dir_all(&directory).expect("temp directory");
-        let path = directory.join("pacman");
-        let mut file = fs::File::create(&path).expect("create fake pacman");
-        file.write_all(body.as_bytes()).expect("write fake pacman");
-        file.sync_all().expect("flush fake pacman");
-        drop(file);
-        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("chmod");
-        path
+    #[tokio::test]
+    async fn flatpak_user_is_rejected_by_the_helper() {
+        let (tx, _rx) = mpsc::channel(4);
+        let request = request(&[UpdateSource::FlatpakUser], &[]);
+        let result = apply_streaming(
+            &request,
+            false,
+            "/bin/true",
+            "/bin/true",
+            tx,
+            CancelHandle::default(),
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[test]
@@ -727,5 +898,48 @@ mod tests {
                     .and_then(|line| line.split_whitespace().nth(2).map(str::to_string))
             })
             .is_some_and(|uid| uid == "0")
+    }
+
+    fn request(sources: &[UpdateSource], holds: &[&str]) -> ApplyRequest {
+        ApplyRequest {
+            sources: sources.to_vec(),
+            holds: holds.iter().map(|hold| hold.to_string()).collect(),
+        }
+    }
+
+    async fn drain(rx: &mut mpsc::Receiver<ApplyEvent>) -> Vec<ApplyEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn fake_pacman(body: &str) -> PathBuf {
+        fake_program("pacman", body)
+    }
+
+    fn fake_flatpak(body: &str) -> PathBuf {
+        fake_program("flatpak", body)
+    }
+
+    fn fake_program(name: &str, body: &str) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let directory =
+            std::env::temp_dir().join(format!("skemer-{name}-{}-{id}", std::process::id()));
+        fs::create_dir_all(&directory).expect("temp directory");
+        let path = directory.join(name);
+        let mut file = fs::File::create(&path).expect("create fake program");
+        file.write_all(body.as_bytes()).expect("write fake program");
+        file.sync_all().expect("flush fake program");
+        drop(file);
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod");
+        path
     }
 }

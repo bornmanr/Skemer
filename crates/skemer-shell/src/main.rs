@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod flatpak;
 mod helper;
 mod tray;
 
