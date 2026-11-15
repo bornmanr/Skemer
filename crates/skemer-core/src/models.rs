@@ -108,6 +108,8 @@ pub struct ApplyRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyOutcome {
     pub success: bool,
+    #[serde(default)]
+    pub cancelled: bool,
     pub held_packages: Vec<String>,
     pub reboot_suggested: bool,
     pub log_tail: String,

@@ -34,6 +34,7 @@ export interface Settings {
 
 export interface ApplyOutcome {
   success: boolean;
+  cancelled: boolean;
   held_packages: string[];
   reboot_suggested: boolean;
   log_tail: string;

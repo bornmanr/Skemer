@@ -1,6 +1,10 @@
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
-use skemer_core::models::ApplyRequest;
+use skemer_core::models::{ApplyOutcome, ApplyRequest};
+use tokio::sync::mpsc;
 use zbus::message::Header;
+use zbus::object_server::SignalEmitter;
 use zbus::{connection, fdo, interface, Connection};
 
 use crate::{polkit, system};
@@ -8,13 +12,35 @@ use crate::{polkit, system};
 pub struct SkemerService {
     /// One libalpm transaction at a time. The lock covers check, hold
     /// validation, and apply so callers cannot race on the pacman database.
-    transaction_lock: tokio::sync::Mutex<()>,
+    transaction_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The running apply, if any.
+    running: Arc<Mutex<Option<RunningJob>>>,
+}
+
+struct RunningJob {
+    cancel: system::CancelHandle,
+    uid: u32,
 }
 
 impl Default for SkemerService {
     fn default() -> Self {
         Self {
-            transaction_lock: tokio::sync::Mutex::new(()),
+            transaction_lock: Arc::new(tokio::sync::Mutex::new(())),
+            running: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+/// Clear the running job when the apply method returns, including on an early
+/// validation error.
+struct RunningGuard {
+    running: Arc<Mutex<Option<RunningJob>>>,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.running.lock() {
+            *running = None;
         }
     }
 }
@@ -44,11 +70,14 @@ impl SkemerService {
         serde_json::to_string(&decision).map_err(failed)
     }
 
-    /// Apply the selected sources. Requires polkit authorization.
+    /// Apply the selected sources. Requires polkit authorization. Progress and
+    /// log lines are emitted as signals while the method runs; the outcome is
+    /// the method reply.
     async fn apply(
         &self,
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] connection: &Connection,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         request: String,
     ) -> Result<String, fdo::Error> {
         let request: ApplyRequest = serde_json::from_str(&request)
@@ -61,15 +90,119 @@ impl SkemerService {
         polkit::authorize(connection, &sender, polkit::APPLY_ACTION)
             .await
             .map_err(failed)?;
+        let uid = connection_uid(connection, &sender).await.map_err(failed)?;
+
+        // Register the cancel handle before waiting for the transaction lock so
+        // a second apply is rejected immediately.
+        let cancel = system::CancelHandle::default();
+        {
+            let mut running = self
+                .running
+                .lock()
+                .map_err(|_| fdo::Error::Failed("the update lock is poisoned".to_string()))?;
+            if running.is_some() {
+                return Err(fdo::Error::Failed(
+                    "an update is already running".to_string(),
+                ));
+            }
+            *running = Some(RunningJob {
+                cancel: cancel.clone(),
+                uid,
+            });
+        }
+        let _running_guard = RunningGuard {
+            running: self.running.clone(),
+        };
 
         let _guard = self.transaction_lock.lock().await;
-        let outcome = system::apply(&request).await.map_err(failed)?;
+
+        // Holds are validated before pacman starts. A rejected hold is a hard
+        // error; the UI asks for confirmation and calls Prepare first.
+        let holds = request.holds.clone();
+        let decision = tokio::task::spawn_blocking(move || system::prepare(&holds))
+            .await
+            .map_err(failed)?
+            .map_err(failed)?;
+        if !decision.safe {
+            return Err(fdo::Error::Failed(decision.reason));
+        }
+
+        let reboot_suggested = tokio::task::spawn_blocking(system::check)
+            .await
+            .map_err(failed)?
+            .map(|plan| plan.reboot_suggested)
+            .unwrap_or(false);
+
+        let (events_tx, mut events_rx) = mpsc::channel::<system::ApplyEvent>(256);
+        let emitter = emitter.to_owned();
+        let forwarder = tokio::spawn(async move {
+            while let Some(event) = events_rx.recv().await {
+                match event {
+                    system::ApplyEvent::Progress { percent, message } => {
+                        let _ = SkemerService::progress(emitter.clone(), percent, message).await;
+                    }
+                    system::ApplyEvent::Log(line) => {
+                        let _ = SkemerService::log_line(emitter.clone(), line).await;
+                    }
+                }
+            }
+        });
+
+        let result =
+            system::apply_streaming(&request, reboot_suggested, "pacman", events_tx, cancel).await;
+
+        // Flush the log/progress signals before returning the outcome.
+        let _ = forwarder.await;
+
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => ApplyOutcome {
+                success: false,
+                cancelled: false,
+                held_packages: request.holds.clone(),
+                reboot_suggested,
+                log_tail: String::new(),
+                error: Some(error.to_string()),
+                candidates: Vec::new(),
+            },
+        };
+
         serde_json::to_string(&outcome).map_err(failed)
     }
 
-    /// Cancel the running transaction. Streaming and interruption arrive with
-    /// the progress phase; until then there is nothing to interrupt.
-    async fn cancel(&self) -> Result<(), fdo::Error> {
+    /// Cancel the running transaction. Only the user that started the update
+    /// may cancel it. SIGINT lets pacman release its lock and transaction
+    /// before exiting.
+    async fn cancel(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Result<(), fdo::Error> {
+        let sender = header
+            .sender()
+            .map(ToString::to_string)
+            .ok_or_else(|| fdo::Error::Failed("missing D-Bus sender".to_string()))?;
+        let uid = connection_uid(connection, &sender).await.map_err(failed)?;
+
+        let handle = {
+            let running = self
+                .running
+                .lock()
+                .map_err(|_| fdo::Error::Failed("the update lock is poisoned".to_string()))?;
+            match running.as_ref() {
+                Some(job) if job.uid == uid => Some(job.cancel.clone()),
+                Some(_) => {
+                    return Err(fdo::Error::AccessDenied(
+                        "only the user that started the update can cancel it".to_string(),
+                    ));
+                }
+                None => None,
+            }
+        };
+
+        if let Some(handle) = handle {
+            handle.cancel();
+        }
         Ok(())
     }
 
@@ -79,6 +212,31 @@ impl SkemerService {
             "mirror refresh is not implemented yet".to_string(),
         ))
     }
+
+    /// One package progressed in the running transaction.
+    #[zbus(signal)]
+    async fn progress(
+        emitter: SignalEmitter<'_>,
+        percent: u32,
+        message: String,
+    ) -> zbus::Result<()>;
+
+    /// One line of pacman output.
+    #[zbus(signal)]
+    async fn log_line(emitter: SignalEmitter<'_>, line: String) -> zbus::Result<()>;
+}
+
+async fn connection_uid(connection: &Connection, sender: &str) -> Result<u32, zbus::Error> {
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionUnixUser",
+            &(sender,),
+        )
+        .await?;
+    reply.body().deserialize::<u32>()
 }
 
 fn failed(error: impl std::fmt::Display) -> fdo::Error {

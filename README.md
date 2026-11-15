@@ -9,11 +9,11 @@ separate, user-run source.
 
 ## Status
 
-The scaffold and the libalpm system source are in place. The privileged helper
-reads the pacman plan, validates one-transaction holds, and applies with
-`pacman -Syu`; the shell reaches it over D-Bus. Flatpak, progress streaming, and
-the tray check loop are next. The design is in
-[`docs/design.md`](docs/design.md); the UI reference is
+The scaffold, the libalpm system source, and the streaming apply path are in
+place. The privileged helper reads the pacman plan, validates one-transaction
+holds, applies with `pacman -Syu`, and streams progress and log lines over
+D-Bus; the UI can cancel a running update. Flatpak and the tray check loop are
+next. The design is in [`docs/design.md`](docs/design.md); the UI reference is
 [`docs/mockup.html`](docs/mockup.html).
 
 ## Shape

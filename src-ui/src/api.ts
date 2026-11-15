@@ -44,6 +44,12 @@ export async function applyUpdates(
   });
 }
 
+export async function cancelUpdates(): Promise<void> {
+  if (!isTauri) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("cancel_updates");
+}
+
 function demoPlan(): import("./types").UpdatePlan {
   const items = [
     ["linux", "core", "6.17.7.arch1-1", "6.17.8.arch1-1", 142, true, "Linux kernel and modules"],

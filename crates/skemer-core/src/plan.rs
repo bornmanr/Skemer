@@ -93,6 +93,26 @@ pub fn reboot_suggested_now(items: &[UpdateItem]) -> bool {
     reboot_suggested(items, modules_present)
 }
 
+/// Parse a pacman transaction line such as `(3/12) upgrading linux` into a
+/// percentage and a short message. Lines without a transaction counter return
+/// `None`.
+pub fn parse_progress(line: &str) -> Option<(u32, String)> {
+    let line = line.trim();
+    let rest = line.strip_prefix('(')?;
+    let (fraction, message) = rest.split_once(')')?;
+    let (current, total) = fraction.split_once('/')?;
+    let current: u32 = current.trim().parse().ok()?;
+    let total: u32 = total.trim().parse().ok()?;
+    if total == 0 || current > total {
+        return None;
+    }
+    let message = message.trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some((current * 100 / total, message.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +180,30 @@ mod tests {
         assert_eq!(plan.total_download_bytes, 0);
         assert_eq!(plan.source_count(UpdateSource::System), 2);
         assert_eq!(plan.sources(), vec![UpdateSource::System]);
+    }
+
+    #[test]
+    fn pacman_progress_lines_are_parsed() {
+        assert_eq!(
+            parse_progress("(3/12) upgrading linux"),
+            Some((25, "upgrading linux".to_string()))
+        );
+        assert_eq!(
+            parse_progress("( 1/10) installing mesa"),
+            Some((10, "installing mesa".to_string()))
+        );
+        assert_eq!(
+            parse_progress("(12/12) checking keys in keyring"),
+            Some((100, "checking keys in keyring".to_string()))
+        );
+    }
+
+    #[test]
+    fn non_progress_lines_are_ignored() {
+        assert_eq!(parse_progress(":: Starting full system upgrade..."), None);
+        assert_eq!(parse_progress("(1/0) broken"), None);
+        assert_eq!(parse_progress("(2/1) broken"), None);
+        assert_eq!(parse_progress("(1/2)"), None);
+        assert_eq!(parse_progress(""), None);
     }
 }

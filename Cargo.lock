@@ -3386,6 +3386,7 @@ dependencies = [
  "alpm",
  "anyhow",
  "chrono",
+ "libc",
  "serde_json",
  "skemer-core",
  "tokio",
@@ -3399,6 +3400,7 @@ name = "skemer-shell"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "serde_json",
  "skemer-core",
  "tauri",
@@ -3406,6 +3408,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "zbus 5.19.0",
