@@ -1,0 +1,93 @@
+name: libalpm ABI Watch
+
+on:
+  schedule:
+    # 10:23 Africa/Johannesburg. GitHub cron uses UTC.
+    - cron: "23 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: skemer-libalpm-abi-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: Check the Arch libalpm soname
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the current soname
+        id: soname
+        shell: bash
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed github-cli >/dev/null
+          current="$(pacman -Qi pacman \
+            | awk -F': ' '/^Provides/ {print $2}' \
+            | tr ' ' '\n' \
+            | sed -n 's/^libalpm\.so=\([0-9][0-9]*\)-64$/\1/p' \
+            | head -n 1)"
+          pinned="$(tr -d '[:space:]' < packaging/libalpm-soname)"
+          if [[ -z "${current}" ]]; then
+            echo "Could not read the libalpm soname from pacman." >&2
+            exit 1
+          fi
+          echo "pinned=${pinned}" >> "${GITHUB_OUTPUT}"
+          echo "current=${current}" >> "${GITHUB_OUTPUT}"
+          if [[ "${current}" != "${pinned}" ]]; then
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+          echo "Arch pacman provides libalpm.so=${current}-64; Skemer pins ${pinned}."
+
+      - name: Open an ABI issue
+        if: steps.soname.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT: ${{ steps.soname.outputs.current }}
+          PINNED: ${{ steps.soname.outputs.pinned }}
+        run: |
+          set -euo pipefail
+          title="libalpm ABI changed to ${CURRENT}"
+          existing="$(gh issue list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --state open \
+            --search "${title} in:title" \
+            --json number \
+            --jq 'length')"
+          if [[ "${existing}" != "0" ]]; then
+            echo "An open issue already tracks ${title}."
+            exit 0
+          fi
+
+          body="$(mktemp)"
+          cat > "${body}" <<EOF
+          Arch's pacman now provides \`libalpm.so=${CURRENT}-64\`, while Skemer pins
+          \`${PINNED}\` in \`packaging/libalpm-soname\`.
+
+          Rebuild Skemer against the new libalpm:
+
+          1. Update \`packaging/libalpm-soname\` to \`${CURRENT}\`.
+          2. Tag a new Skemer release. The release workflow refuses to build when
+             the pinned soname does not match the Arch container.
+          3. Update the \`libalpm.so=${CURRENT}-64\` dependency in the Veldmuis
+             \`veldmuis-skemer\` package.
+
+          The package dependency intentionally blocks a pacman upgrade that would
+          leave Skemer linked against the old ABI until the rebuilt package is
+          available.
+          EOF
+          gh issue create \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${title}" \
+            --body-file "${body}"

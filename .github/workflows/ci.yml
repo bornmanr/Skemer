@@ -27,6 +27,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check the pinned libalpm soname
+        shell: bash
+        run: |
+          set -euo pipefail
+          pinned="$(tr -d '[:space:]' < packaging/libalpm-soname)"
+          current="$(pacman -Qi pacman \
+            | awk -F': ' '/^Provides/ {print $2}' \
+            | tr ' ' '\n' \
+            | sed -n 's/^libalpm\.so=\([0-9][0-9]*\)-64$/\1/p' \
+            | head -n 1)"
+          echo "pinned libalpm.so=${pinned}; build container provides libalpm.so=${current}"
+          if [[ -z "${current}" || "${pinned}" != "${current}" ]]; then
+            echo "libalpm ABI changed. Update packaging/libalpm-soname and rebuild; see packaging/README.md." >&2
+            exit 1
+          fi
+
       - name: Build frontend
         run: |
           npm ci --prefix src-ui

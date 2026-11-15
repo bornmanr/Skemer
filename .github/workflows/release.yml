@@ -1,0 +1,186 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        name: Read version and check the tag
+        run: |
+          set -euo pipefail
+          version=$(python3 -c "import json;print(json.load(open('crates/skemer-shell/tauri.conf.json'))['version'])")
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            [[ "${GITHUB_REF_NAME}" == "v${version}" ]] || {
+              echo "tag ${GITHUB_REF_NAME} does not match tauri.conf.json version v${version}" >&2
+              exit 1
+            }
+          fi
+
+  linux-tarball:
+    name: Linux tarball
+    needs: version
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git nodejs npm rust pkgconf \
+            webkit2gtk-4.1 gtk3 libayatana-appindicator
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the pinned libalpm soname
+        shell: bash
+        run: |
+          set -euo pipefail
+          pinned="$(tr -d '[:space:]' < packaging/libalpm-soname)"
+          current="$(pacman -Qi pacman \
+            | awk -F': ' '/^Provides/ {print $2}' \
+            | tr ' ' '\n' \
+            | sed -n 's/^libalpm\.so=\([0-9][0-9]*\)-64$/\1/p' \
+            | head -n 1)"
+          echo "pinned libalpm.so=${pinned}; build container provides libalpm.so=${current}"
+          if [[ -z "${current}" ]]; then
+            echo "Could not read the libalpm soname from pacman." >&2
+            exit 1
+          fi
+          if [[ "${pinned}" != "${current}" ]]; then
+            echo "libalpm ABI changed. Update packaging/libalpm-soname and rebuild; see packaging/README.md." >&2
+            exit 1
+          fi
+      - name: Build frontend
+        run: |
+          npm ci --prefix src-ui
+          npm run build --prefix src-ui
+      - name: Build binaries
+        run: |
+          cargo build --release --locked -p skemer-shell -p skemer-helper \
+            --features skemer-shell/custom-protocol
+      - name: Assemble tarball
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          staging="skemer-${VERSION}-x86_64-linux"
+          mkdir -p "${staging}/icons"
+          cp target/release/skemer target/release/skemer-helper "${staging}/"
+          cp data/skemer.desktop \
+             data/skemer-autostart.desktop \
+             data/skemer-helper.service \
+             data/org.veldmuislinux.skemer.service \
+             data/org.veldmuislinux.skemer.conf \
+             data/org.veldmuislinux.skemer.policy \
+             "${staging}/"
+          cp data/icons/skemer.png "${staging}/icons/skemer.png"
+          cp LICENSE "${staging}/LICENSE"
+          tar -czf "${staging}.tar.gz" "${staging}"
+          sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux-tarball
+          path: |
+            skemer-*-x86_64-linux.tar.gz
+            skemer-*-x86_64-linux.tar.gz.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: [version, linux-tarball]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Provides SKEMER_GPG_PRIVATE_KEY / SKEMER_GPG_PASSPHRASE / SKEMER_GPG_FPR.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the release key
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in \
+            packaging/keys/skemer-release.gpg \
+            packaging/keys/skemer-release.asc \
+            packaging/keys/skemer-trusted
+          do
+            [[ -r "${file}" ]] || {
+              echo "Missing ${file}. See packaging/keys/README.md." >&2
+              exit 1
+            }
+          done
+      - name: Assemble SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f -name '*.tar.gz' -print0 \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+      - name: Sign release artifacts
+        env:
+          SKEMER_GPG_PRIVATE_KEY: ${{ secrets.SKEMER_GPG_PRIVATE_KEY }}
+          SKEMER_GPG_PASSPHRASE: ${{ secrets.SKEMER_GPG_PASSPHRASE }}
+          SKEMER_GPG_FPR: ${{ secrets.SKEMER_GPG_FPR }}
+        run: |
+          set -euo pipefail
+          key_file="${RUNNER_TEMP}/skemer-release-key.asc"
+          pass_file="${RUNNER_TEMP}/skemer-release-passphrase"
+          ( umask 077; printf '%s\n' "${SKEMER_GPG_PRIVATE_KEY}" > "${key_file}" )
+          ( umask 077; printf '%s' "${SKEMER_GPG_PASSPHRASE}" > "${pass_file}" )
+          cleanup() { rm -f "${key_file}" "${pass_file}"; }
+          trap cleanup EXIT
+
+          gpg --batch --import "${key_file}"
+
+          shopt -s nullglob
+          artifacts=(dist/*.tar.gz dist/SHA256SUMS)
+          for artifact in "${artifacts[@]}"; do
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-file "${pass_file}" \
+              --local-user "${SKEMER_GPG_FPR}" \
+              --armor --detach-sign "${artifact}"
+            echo "signed ${artifact}.asc"
+          done
+      - name: Verify signatures
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          artifacts=(dist/*.tar.gz dist/SHA256SUMS)
+          for artifact in "${artifacts[@]}"; do
+            gpgv --keyring packaging/keys/skemer-release.gpg "${artifact}.asc" "${artifact}"
+          done
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz \
+            dist/SHA256SUMS dist/*.asc packaging/keys/skemer-release.asc \
+            --title "Skemer ${GITHUB_REF_NAME}" --generate-notes
