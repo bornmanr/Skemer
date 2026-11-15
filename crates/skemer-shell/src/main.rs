@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod helper;
 mod tray;
 
 fn main() {
@@ -19,6 +20,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::check_updates,
+            commands::prepare_holds,
             commands::apply_updates,
             commands::load_settings,
             commands::save_settings,

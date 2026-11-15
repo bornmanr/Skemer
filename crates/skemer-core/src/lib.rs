@@ -4,10 +4,12 @@
 //! shared by the shell, the privileged helper, and the CLI.
 
 pub mod models;
+pub mod pacman_conf;
 pub mod paths;
 pub mod plan;
 pub mod settings;
 pub mod sources;
 
 pub use models::{ApplyOutcome, ApplyRequest, HoldDecision, UpdateItem, UpdatePlan, UpdateSource};
+pub use pacman_conf::PacmanConf;
 pub use settings::Settings;

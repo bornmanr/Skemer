@@ -1,6 +1,6 @@
 use crate::models::UpdateItem;
 
-fn is_reboot_package(name: &str) -> bool {
+pub fn is_reboot_package(name: &str) -> bool {
     matches!(
         name,
         "linux"
@@ -75,6 +75,22 @@ pub fn running_kernel_modules_present(running_kernel: &str) -> bool {
     std::path::Path::new("/usr/lib/modules")
         .join(running_kernel)
         .is_dir()
+}
+
+/// The running kernel release, read from `/proc`.
+pub fn running_kernel() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|release| release.trim().to_string())
+        .filter(|release| !release.is_empty())
+}
+
+/// Reboot recommendation for the current machine.
+pub fn reboot_suggested_now(items: &[UpdateItem]) -> bool {
+    let modules_present = running_kernel()
+        .map(|kernel| running_kernel_modules_present(&kernel))
+        .unwrap_or(true);
+    reboot_suggested(items, modules_present)
 }
 
 #[cfg(test)]

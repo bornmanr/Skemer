@@ -20,6 +20,19 @@ impl UpdateSource {
     }
 }
 
+impl std::str::FromStr for UpdateSource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "system" => Ok(Self::System),
+            "flatpak-system" => Ok(Self::FlatpakSystem),
+            "flatpak-user" => Ok(Self::FlatpakUser),
+            other => Err(format!("unknown update source: {other}")),
+        }
+    }
+}
+
 /// One pending package update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateItem {
@@ -98,6 +111,13 @@ pub struct ApplyOutcome {
     pub held_packages: Vec<String>,
     pub reboot_suggested: bool,
     pub log_tail: String,
+    /// Human-readable failure reason when `success` is false.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Packages that look like the cause of a failure. These are hints for the
+    /// UI; the helper validates any proposed hold with libalpm.
+    #[serde(default)]
+    pub candidates: Vec<String>,
 }
 
 /// Result of validating a proposed hold with libalpm.
