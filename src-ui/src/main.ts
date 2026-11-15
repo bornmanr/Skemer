@@ -137,6 +137,23 @@ function flatpakGroup(
 }
 
 let renderQueued = false;
+let autoRefreshTimer: number | null = null;
+
+function scheduleAutoRefresh(): void {
+  if (autoRefreshTimer !== null) {
+    window.clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+  if (!isTauri) return;
+  const hours = state.settings.check_interval_hours;
+  if (hours <= 0) return;
+  autoRefreshTimer = window.setInterval(
+    () => {
+      if (!state.applying && !state.loading) void refresh();
+    },
+    hours * 60 * 60 * 1000,
+  );
+}
 
 function scheduleRender(): void {
   if (renderQueued) return;
@@ -477,6 +494,7 @@ async function saveSettingsFromForm(): Promise<void> {
   try {
     await saveSettings(state.settings);
     applySettingsToSelection(state.settings);
+    scheduleAutoRefresh();
     state.settingsOpen = false;
     await refresh();
   } catch (error) {
@@ -492,6 +510,7 @@ void (async () => {
     state.error = String(error);
   }
   applySettingsToSelection(state.settings);
+  scheduleAutoRefresh();
   try {
     await subscribeToUpdates();
   } catch (error) {

@@ -26,8 +26,9 @@ PTY-backed worker and a persistent user-supported warning.
 - Default check interval: 6 hours (configurable: 1/3/6/12/24 hours, or never).
 - Desktop notifications on by default.
 - Close to tray by default; tray “Quit” exits.
-- The main window is created on demand. No WebKitGTK process is kept alive
-  while the window is closed; the tray and periodic checker live in Rust.
+- The main window is created on demand. It runs in a short-lived
+  `skemer --window` child process; closing it exits that process and releases
+  WebKitGTK. The tray and periodic checker live in the Rust parent process.
 - Window: 960 × 640 default, 760 × 520 minimum, not maximized.
 - “Reboot suggested”, never “required”. Amber chip, not red.
 
@@ -65,9 +66,11 @@ Deferred. No AUR tab, no AUR code path, and no AUR privilege path in v1.
 ## 4. Privilege Model
 
 ```text
-Tauri UI (user)
-  ├─ tray and periodic checker (Rust, user)
-  ├─ Flatpak user updates (user)
+skemer --tray (user)
+  ├─ tray, periodic checker, notifications (Rust)
+  ├─ skemer --window (user, on demand)
+  │    ├─ WebKitGTK window; exits when closed
+  │    └─ Flatpak user updates (user)
   └─ D-Bus → org.veldmuislinux.skemer
        └─ skemer-helper (root, systemd/D-Bus activated)
             ├─ libalpm check/prepare
@@ -87,6 +90,9 @@ Tauri UI (user)
 - One transaction at a time. The helper releases the pacman DB lock on exit.
 - AUR helpers are never run by the helper.
 - Logs go to the journal; the UI shows the streamed log.
+- The tray parent and window child use small signals: SIGHUP reloads settings,
+  SIGUSR1 refreshes the tray state, SIGUSR2 focuses an existing window, and
+  SIGTERM closes the whole app when close-to-tray is off.
 
 The D-Bus name is `org.veldmuislinux.skemer`; the polkit action is
 `org.veldmuislinux.skemer.apply`.

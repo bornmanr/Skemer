@@ -2,25 +2,15 @@ use std::str::FromStr;
 
 use skemer_core::models::{ApplyOutcome, ApplyRequest, HoldDecision, UpdatePlan, UpdateSource};
 use skemer_core::Settings;
+use tauri::Manager;
 
-use crate::{flatpak, helper};
+use crate::state::AppState;
+use crate::{autostart, flatpak, helper, planner, tray};
 
 #[tauri::command]
-pub async fn check_updates() -> Result<UpdatePlan, String> {
-    let settings = Settings::load().unwrap_or_default();
-    let mut plan = helper::check().await.map_err(|error| error.to_string())?;
-    let mut warnings = plan.warnings.clone();
-
-    let (plan, flatpak_warnings) = tokio::task::spawn_blocking(move || {
-        let flatpak_warnings = flatpak::add_flatpak(&mut plan, &settings);
-        (plan, flatpak_warnings)
-    })
-    .await
-    .map_err(|error| error.to_string())?;
-
-    warnings.extend(flatpak_warnings);
-    let mut plan = plan;
-    plan.warnings = warnings;
+pub async fn check_updates(app: tauri::AppHandle) -> Result<UpdatePlan, String> {
+    let plan = planner::build().await.map_err(|error| error.to_string())?;
+    tray::update_tooltip(&app, &plan);
     Ok(plan)
 }
 
@@ -42,6 +32,17 @@ pub async fn apply_updates(
         .map(|source| UpdateSource::from_str(source))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let result = apply_sources(&app, sources, holds).await;
+    // Ask the tray parent to refresh its tooltip and notification state.
+    crate::state::signal_parent(libc::SIGUSR1);
+    result
+}
+
+async fn apply_sources(
+    app: &tauri::AppHandle,
+    sources: Vec<UpdateSource>,
+    holds: Vec<String>,
+) -> Result<ApplyOutcome, String> {
     let wants_user = sources.contains(&UpdateSource::FlatpakUser);
     let helper_sources: Vec<UpdateSource> = sources
         .iter()
@@ -64,7 +65,7 @@ pub async fn apply_updates(
     };
 
     if outcome.success && wants_user {
-        match flatpak::apply_user(&app).await {
+        match flatpak::apply_user(app).await {
             Ok(user) => {
                 outcome.log_tail = flatpak::combine_logs(outcome.log_tail, user.log_tail);
                 if !user.success {
@@ -95,8 +96,15 @@ pub async fn load_settings() -> Result<Settings, String> {
 }
 
 #[tauri::command]
-pub async fn save_settings(settings: Settings) -> Result<(), String> {
-    settings.save().map_err(|error| error.to_string())
+pub async fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
+    settings.save().map_err(|error| error.to_string())?;
+    autostart::apply(settings.autostart).map_err(|error| error.to_string())?;
+
+    let state = app.state::<AppState>();
+    state.set_settings(settings);
+    state.settings_changed.notify_waiters();
+    crate::state::signal_parent(libc::SIGHUP);
+    Ok(())
 }
 
 fn empty_outcome() -> ApplyOutcome {

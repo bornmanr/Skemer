@@ -41,6 +41,7 @@ pub fn try_run() -> bool {
             true
         }
         "--tray" => false,
+        "--window" => false,
         other => {
             eprintln!("skemer: unknown command: {other}");
             print_help();
