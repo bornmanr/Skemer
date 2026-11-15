@@ -396,7 +396,7 @@ EOF
   log "  git -C ${HOME}/Projects/Skemer tag -a v0.1.0 -m 'Skemer 0.1.0'"
   log "  git -C ${HOME}/Projects/Skemer push origin v0.1.0"
   log "Then run the Veldmuis release watch:"
-  log "  gh workflow run skemer-release-watch.yml --repo ruannnebornman/veldmuis"
+  log "  gh workflow run skemer-release-watch.yml --repo bornmanr/veldmuis"
 }
 
 main "$@"
