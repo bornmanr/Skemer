@@ -1,6 +1,6 @@
 [Unit]
 Description=Skemer privileged update helper
-Documentation=https://github.com/ruannnebornman/Skemer
+Documentation=https://github.com/bornmanr/skemer
 
 [Service]
 Type=dbus

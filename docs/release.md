@@ -59,7 +59,7 @@ SKEMER_GPG_FPR           primary fingerprint, must match skemer-trusted
 Values are write-only. Confirm the names with:
 
 ```sh
-gh secret list --env release --repo bornmanr/Skemer
+gh secret list --env release --repo bornmanr/skemer
 ```
 
 ### Key custody
@@ -112,7 +112,7 @@ creates a release.
 Any machine with `gpgv` can check a release against the committed public key:
 
 ```sh
-gh release download v0.1.1 --repo bornmanr/Skemer \
+gh release download v0.1.1 --repo bornmanr/skemer \
   --pattern 'SHA256SUMS*' --pattern 'skemer-0.1.1-x86_64-linux.tar.gz*'
 
 gpgv --keyring packaging/keys/skemer-release.gpg SHA256SUMS.asc SHA256SUMS
