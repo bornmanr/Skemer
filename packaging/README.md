@@ -12,6 +12,7 @@ The Veldmuis package is `veldmuis-skemer`. It should install:
 /usr/lib/skemer/skemer-helper
 /usr/lib/systemd/system/skemer-helper.service
 /usr/share/dbus-1/system-services/org.veldmuislinux.skemer.service
+/usr/share/dbus-1/system.d/org.veldmuislinux.skemer.conf
 /usr/share/polkit-1/actions/org.veldmuislinux.skemer.policy
 /usr/share/applications/skemer.desktop
 /etc/xdg/autostart/skemer.desktop
@@ -45,6 +46,10 @@ flatpak
 only installed against a compatible libalpm. The ABI watcher triggers a new
 Skemer release when the soname changes; Skemer and libalpm upgrade atomically
 in `pacman -Syu`.
+
+The D-Bus policy in `data/org.veldmuislinux.skemer.conf` lets root own the
+service name and lets local users send read-only requests. The helper itself
+checks polkit before `Apply` or `RefreshMirrors`.
 
 ## Release
 

@@ -37,6 +37,8 @@ export interface ApplyOutcome {
   held_packages: string[];
   reboot_suggested: boolean;
   log_tail: string;
+  error: string | null;
+  candidates: string[];
 }
 
 export const SOURCE_LABELS: Record<UpdateSource, string> = {

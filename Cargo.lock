@@ -33,6 +33,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpm"
+version = "5.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c7b56a77dc29bbe3c1d2b2a073200b7a09ed0a5d0b421315e915abdee4e1f2b"
+dependencies = [
+ "alpm-sys",
+ "bitflags 2.13.2",
+]
+
+[[package]]
+name = "alpm-sys"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2802ef5d74e47cceda08d0d583c69be2595a5d25e2d6eef349b5e5b5ed4560e9"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -493,8 +512,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -3362,7 +3383,9 @@ dependencies = [
 name = "skemer-helper"
 version = "0.1.0"
 dependencies = [
+ "alpm",
  "anyhow",
+ "chrono",
  "serde_json",
  "skemer-core",
  "tokio",
@@ -3375,6 +3398,7 @@ dependencies = [
 name = "skemer-shell"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "serde_json",
  "skemer-core",
  "tauri",
@@ -3384,6 +3408,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tracing",
  "tracing-subscriber",
+ "zbus 5.19.0",
 ]
 
 [[package]]

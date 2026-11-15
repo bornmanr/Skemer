@@ -261,14 +261,20 @@ async function apply(): Promise<void> {
   state.loading = true;
   state.error = null;
   render();
+  const sources = [...state.selected].filter((source) => sourceCount(source) > 0);
   try {
-    await applyUpdates([...state.selected], []);
-    state.error = "Apply is not implemented yet.";
+    const outcome = await applyUpdates(sources, []);
+    if (!outcome.success) {
+      state.error = outcome.error ?? "The update did not complete.";
+    }
   } catch (error) {
     state.error = String(error);
   } finally {
     state.loading = false;
     render();
+  }
+  if (!state.error) {
+    await refresh();
   }
 }
 

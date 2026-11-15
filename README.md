@@ -9,18 +9,21 @@ separate, user-run source.
 
 ## Status
 
-This repository is at the scaffold stage. The design is in
+The scaffold and the libalpm system source are in place. The privileged helper
+reads the pacman plan, validates one-transaction holds, and applies with
+`pacman -Syu`; the shell reaches it over D-Bus. Flatpak, progress streaming, and
+the tray check loop are next. The design is in
 [`docs/design.md`](docs/design.md); the UI reference is
 [`docs/mockup.html`](docs/mockup.html).
 
 ## Shape
 
 ```text
-crates/skemer-core/    models, settings, plan and hold helpers, source traits
-crates/skemer-shell/   Tauri 2 window, tray, CLI routing, notifications
-crates/skemer-helper/  privileged D-Bus service
+crates/skemer-core/    models, settings, plan, pacman.conf and hold helpers
+crates/skemer-shell/   Tauri 2 window, tray, CLI routing, D-Bus client
+crates/skemer-helper/  privileged D-Bus service and libalpm/pacman apply
 src-ui/                TypeScript + Vite frontend
-data/                  desktop entry, D-Bus service, polkit policy, icons
+data/                  desktop entry, D-Bus service/policy, polkit policy, icons
 docs/                  design and UI reference
 tests/fixtures/        shared IPC contract
 ```

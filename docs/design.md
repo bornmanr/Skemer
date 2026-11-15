@@ -156,8 +156,8 @@ Skemer replaces the bash `veldmuis-update` wrapper.
 - `veldmuis-update` — argv[0] alias to `skemer update`.
 
 The CLI is the root/recovery path. The GUI is the polkit path. `skemer check`
-runs as the user via libalpm read-only; if the DBs are not readable, it says so
-and suggests `sudo skemer check`.
+asks the helper for a read-only plan; if the helper is unavailable it says so
+and suggests starting `skemer-helper`.
 
 ## 9. Delivery
 
@@ -193,7 +193,9 @@ and suggests `sudo skemer check`.
 
 ## 12. Open Implementation Details
 
-- Exact D-Bus method/signal names and versioning.
+- The fixed D-Bus methods are `Check`, `Prepare`, `Apply`, `Cancel`, and
+  `RefreshMirrors`. Progress signals and cancellation land with the streaming
+  phase.
 - Flatpak column parsing and installed-version lookup.
 - Theme loader format (CSS variables + a small theme manifest).
 - Log retention and copy-log behavior.
