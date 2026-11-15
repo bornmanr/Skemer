@@ -9,19 +9,18 @@ separate, user-run source.
 
 ## Status
 
-The scaffold, the libalpm system source, the streaming apply path, and Flatpak
-system/user updates are in place. The privileged helper reads the pacman plan,
-validates one-transaction holds, applies with `pacman -Syu`, and streams
-progress and log lines over D-Bus; the UI can cancel a running update. Flatpak
-check and apply use one tab with system and user groups. The tray check loop is
-next. The design is in [`docs/design.md`](docs/design.md); the UI reference is
+The scaffold, the system and Flatpak sources, the streaming apply path, and the
+tray lifecycle are in place. The tray process owns periodic checks,
+notifications, and autostart; the window runs in a short-lived `skemer --window`
+child so closing it releases WebKitGTK. Packaging and release are next. The
+design is in [`docs/design.md`](docs/design.md); the UI reference is
 [`docs/mockup.html`](docs/mockup.html).
 
 ## Shape
 
 ```text
 crates/skemer-core/    models, settings, plan, pacman.conf and hold helpers
-crates/skemer-shell/   Tauri 2 window, tray, CLI routing, D-Bus client
+crates/skemer-shell/   Tauri tray + window child, CLI routing, D-Bus client
 crates/skemer-helper/  privileged D-Bus service and libalpm/pacman apply
 src-ui/                TypeScript + Vite frontend
 data/                  desktop entry, D-Bus service/policy, polkit policy, icons

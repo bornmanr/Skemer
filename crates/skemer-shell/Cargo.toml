@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 futures-util = "0.3"
+libc = "0.2"
 serde_json.workspace = true
 skemer-core = { path = "../skemer-core" }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }

@@ -26,6 +26,12 @@ pub fn config_file() -> Option<PathBuf> {
     config_dir().map(|path| path.join("settings.json"))
 }
 
+/// The user-level XDG autostart entry. A file here overrides the system-wide
+/// entry installed by the package.
+pub fn autostart_file() -> Option<PathBuf> {
+    xdg_dir("XDG_CONFIG_HOME", ".config").map(|path| path.join("autostart/skemer.desktop"))
+}
+
 pub fn state_file() -> Option<PathBuf> {
     state_dir().map(|path| path.join("state.json"))
 }
