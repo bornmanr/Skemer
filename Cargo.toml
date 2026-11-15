@@ -10,7 +10,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/ruannnebornman/Skemer"
+repository = "https://github.com/bornmanr/skemer"
 rust-version = "1.85"
 
 [workspace.dependencies]
