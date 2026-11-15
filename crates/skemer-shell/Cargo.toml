@@ -11,6 +11,10 @@ description = "Skemer Tauri shell, tray, and CLI entry point"
 name = "skemer"
 path = "src/main.rs"
 
+[features]
+# Enabled by the release build so the frontend is embedded instead of using devUrl.
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 anyhow.workspace = true
 futures-util = "0.3"
