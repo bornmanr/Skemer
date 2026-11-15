@@ -22,6 +22,7 @@ fn main() {
             commands::check_updates,
             commands::prepare_holds,
             commands::apply_updates,
+            commands::cancel_updates,
             commands::load_settings,
             commands::save_settings,
         ])

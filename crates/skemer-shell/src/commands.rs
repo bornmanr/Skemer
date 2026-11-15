@@ -19,6 +19,7 @@ pub async fn prepare_holds(holds: Vec<String>) -> Result<HoldDecision, String> {
 
 #[tauri::command]
 pub async fn apply_updates(
+    app: tauri::AppHandle,
     sources: Vec<String>,
     holds: Vec<String>,
 ) -> Result<ApplyOutcome, String> {
@@ -27,9 +28,14 @@ pub async fn apply_updates(
         .map(|source| UpdateSource::from_str(source))
         .collect::<Result<Vec<_>, _>>()?;
     let request = ApplyRequest { sources, holds };
-    helper::apply(&request)
+    helper::apply(app, request)
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn cancel_updates() -> Result<(), String> {
+    helper::cancel().await.map_err(|error| error.to_string())
 }
 
 #[tauri::command]

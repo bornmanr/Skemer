@@ -1,6 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use alpm::{Alpm, SigLevel, TransFlag};
 use anyhow::{Context, Result};
@@ -8,6 +11,8 @@ use skemer_core::models::{
     ApplyOutcome, ApplyRequest, HoldDecision, UpdateItem, UpdatePlan, UpdateSource,
 };
 use skemer_core::{pacman_conf, plan};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 
 const ROOT: &str = "/";
 const DB_PATH: &str = "/var/lib/pacman";
@@ -70,9 +75,67 @@ pub fn prepare(holds: &[String]) -> Result<HoldDecision> {
     handle.prepare_with(holds)
 }
 
-/// Apply the system update with `pacman -Syu`, so hooks and transaction
-/// behavior are exactly pacman's.
-pub async fn apply(request: &ApplyRequest) -> Result<ApplyOutcome> {
+/// One update can be cancelled at a time.
+#[derive(Clone, Default)]
+pub struct CancelHandle {
+    cancelled: Arc<AtomicBool>,
+    pid: Arc<Mutex<Option<u32>>>,
+}
+
+impl CancelHandle {
+    /// Ask pacman to stop. SIGINT lets pacman release its transaction and the
+    /// pacman database lock cleanly. The signal goes to the child's process
+    /// group so helper processes stop too.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let Ok(pid) = self.pid.lock() else {
+            return;
+        };
+        let Some(pid) = *pid else {
+            return;
+        };
+        if pid == 0 {
+            return;
+        }
+        let pid = pid as i32;
+        // The group signal is the important one; the direct signal covers a
+        // child that did not get its own process group.
+        unsafe {
+            libc::kill(pid, libc::SIGINT);
+            libc::kill(-pid, libc::SIGINT);
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn set_pid(&self, pid: Option<u32>) {
+        if let Ok(mut current) = self.pid.lock() {
+            *current = pid;
+        }
+    }
+}
+
+/// Progress and log events from a running apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyEvent {
+    Progress { percent: u32, message: String },
+    Log(String),
+}
+
+/// Run `pacman -Syu`, streaming progress and log lines through `events`.
+///
+/// Holds are assumed to have been validated by the caller. `reboot_suggested`
+/// is computed before the transaction starts so a kernel update is still
+/// visible after pacman has replaced the running modules.
+pub async fn apply_streaming(
+    request: &ApplyRequest,
+    reboot_suggested: bool,
+    pacman: &str,
+    events: mpsc::Sender<ApplyEvent>,
+    cancel: CancelHandle,
+) -> Result<ApplyOutcome> {
     if request
         .sources
         .iter()
@@ -82,72 +145,153 @@ pub async fn apply(request: &ApplyRequest) -> Result<ApplyOutcome> {
     }
 
     if !request.sources.contains(&UpdateSource::System) {
-        return Ok(ApplyOutcome {
-            success: true,
-            held_packages: Vec::new(),
-            reboot_suggested: false,
-            log_tail: String::new(),
-            error: None,
-            candidates: Vec::new(),
-        });
+        return Ok(empty_outcome());
     }
 
     let holds = normalized_holds(&request.holds);
+    emit(
+        &events,
+        ApplyEvent::Progress {
+            percent: 0,
+            message: "Preparing transaction".to_string(),
+        },
+    )
+    .await;
 
-    let decision = {
-        let holds = holds.clone();
-        tokio::task::spawn_blocking(move || prepare(&holds))
-            .await
-            .context("join the hold validation task")??
-    };
-    if !decision.safe {
-        return Ok(ApplyOutcome {
-            success: false,
-            held_packages: holds,
-            reboot_suggested: false,
-            log_tail: String::new(),
-            error: Some(decision.reason),
-            candidates: decision.candidates,
-        });
-    }
-
-    let reboot_suggested = tokio::task::spawn_blocking(check)
-        .await
-        .context("join the plan task")?
-        .map(|plan| plan.reboot_suggested)
-        .unwrap_or(false);
-
-    let mut command = tokio::process::Command::new("pacman");
+    let mut command = tokio::process::Command::new(pacman);
     command
         .arg("-Syu")
         .arg("--noconfirm")
         .arg("--color")
         .arg("never")
-        .env("LC_ALL", "C");
+        .env("LC_ALL", "C")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
     if !holds.is_empty() {
         command.arg("--ignore").arg(holds.join(","));
     }
 
-    let output = command.output().await.context("run pacman -Syu")?;
-    let log = combined_log(&output.stdout, &output.stderr);
-    let success = output.status.success();
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("run {pacman} -Syu"))?;
+    cancel.set_pid(child.id());
+    if cancel.is_cancelled() {
+        cancel.cancel();
+    }
+
+    let (line_tx, mut line_rx) = mpsc::channel::<String>(256);
+    if let Some(stdout) = child.stdout.take() {
+        let sender = line_tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if sender.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let sender = line_tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if sender.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(line_tx);
+
+    let wait = tokio::spawn(async move { child.wait().await });
+
+    let mut log_tail: VecDeque<String> = VecDeque::with_capacity(200);
+    let mut percent = 0u32;
+    while let Some(line) = line_rx.recv().await {
+        let line = line.trim_end().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        let _ = events.send(ApplyEvent::Log(line.clone())).await;
+
+        if let Some((new_percent, message)) = plan::parse_progress(&line) {
+            percent = new_percent;
+            let _ = events.send(ApplyEvent::Progress { percent, message }).await;
+        } else if let Some(message) = line.strip_prefix(":: ") {
+            let _ = events
+                .send(ApplyEvent::Progress {
+                    percent,
+                    message: message.to_string(),
+                })
+                .await;
+        }
+
+        if log_tail.len() == 200 {
+            log_tail.pop_front();
+        }
+        log_tail.push_back(line);
+    }
+
+    let status = wait.await.context("join the pacman wait task")??;
+    // A cancel that arrives after pacman has already succeeded should not turn
+    // a completed update into a cancelled one.
+    let cancelled = cancel.is_cancelled() && !status.success();
+    cancel.set_pid(None);
+
+    let log = log_tail.into_iter().collect::<Vec<_>>().join("\n");
+    let success = status.success() && !cancelled;
+
+    let (error, candidates) = if success {
+        (None, Vec::new())
+    } else if cancelled {
+        (Some("Update cancelled.".to_string()), Vec::new())
+    } else {
+        (
+            Some(failure_message(&log)),
+            plan::hold_candidates_from_error(&log),
+        )
+    };
+
+    let _ = events
+        .send(ApplyEvent::Progress {
+            percent: if success { 100 } else { percent },
+            message: if success {
+                "Update complete".to_string()
+            } else if cancelled {
+                "Update cancelled".to_string()
+            } else {
+                "Update failed".to_string()
+            },
+        })
+        .await;
 
     Ok(ApplyOutcome {
         success,
+        cancelled,
         held_packages: holds,
         reboot_suggested,
-        error: if success {
-            None
-        } else {
-            Some(failure_message(&log))
-        },
-        candidates: if success {
-            Vec::new()
-        } else {
-            plan::hold_candidates_from_error(&log)
-        },
-        log_tail: tail_lines(&log, 200),
+        log_tail: log,
+        error,
+        candidates,
     })
+}
+
+async fn emit(events: &mpsc::Sender<ApplyEvent>, event: ApplyEvent) {
+    let _ = events.send(event).await;
+}
+
+fn empty_outcome() -> ApplyOutcome {
+    ApplyOutcome {
+        success: true,
+        cancelled: false,
+        held_packages: Vec::new(),
+        reboot_suggested: false,
+        log_tail: String::new(),
+        error: None,
+        candidates: Vec::new(),
+    }
 }
 
 struct SystemHandle {
@@ -352,26 +496,6 @@ fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn combined_log(stdout: &[u8], stderr: &[u8]) -> String {
-    let mut log = String::from_utf8_lossy(stdout).into_owned();
-    let stderr = String::from_utf8_lossy(stderr);
-    if !stderr.trim().is_empty() {
-        if !log.ends_with('\n') && !log.is_empty() {
-            log.push('\n');
-        }
-        log.push_str(&stderr);
-    }
-    log
-}
-
-fn tail_lines(text: &str, limit: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= limit {
-        return text.to_string();
-    }
-    lines[lines.len() - limit..].join("\n")
-}
-
 fn failure_message(log: &str) -> String {
     log.lines()
         .rev()
@@ -387,6 +511,7 @@ fn failure_message(log: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn holds_are_trimmed_sorted_and_deduplicated() {
@@ -402,22 +527,147 @@ mod tests {
     }
 
     #[test]
-    fn tail_keeps_the_last_lines() {
-        let text = "one\ntwo\nthree\nfour";
-        assert_eq!(tail_lines(text, 2), "three\nfour");
-        assert_eq!(tail_lines(text, 10), text);
-    }
-
-    #[test]
     fn failure_message_prefers_the_last_error_line() {
         let log = "warning: something\nsome error: first\nerror: failed to commit transaction";
         assert_eq!(failure_message(log), "error: failed to commit transaction");
     }
 
-    #[test]
-    fn combined_log_includes_stderr() {
-        let log = combined_log(b"upgrading\n", b"error: nope\n");
-        assert_eq!(log, "upgrading\nerror: nope\n");
+    #[tokio::test]
+    async fn streaming_apply_reports_progress_and_logs() {
+        let script = fake_pacman(
+            "#!/bin/sh\n\
+             echo ':: Starting full system upgrade...'\n\
+             echo '(1/2) upgrading linux'\n\
+             echo '(2/2) upgrading mesa'\n\
+             exit 0\n",
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = request(&[]);
+        let outcome = apply_streaming(
+            &request,
+            true,
+            script.to_str().expect("script path"),
+            tx,
+            CancelHandle::default(),
+        )
+        .await
+        .expect("apply");
+        let events = drain(&mut rx).await;
+
+        assert!(outcome.success);
+        assert!(!outcome.cancelled);
+        assert!(outcome.reboot_suggested);
+        assert!(outcome.log_tail.contains("(2/2) upgrading mesa"));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ApplyEvent::Progress { percent: 50, .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ApplyEvent::Progress { percent: 100, .. })));
+        assert!(events.iter().any(
+            |event| matches!(event, ApplyEvent::Log(line) if line.contains("upgrading linux"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_apply_reports_failure_candidates() {
+        let script = fake_pacman(
+            "#!/bin/sh\n\
+             echo \"error: failed to commit transaction (conflicting files)\"\n\
+             echo \"/usr/lib/foo: /usr/lib/foo exists in both 'mpv' and 'mpv-old'\"\n\
+             exit 1\n",
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = request(&[]);
+        let outcome = apply_streaming(
+            &request,
+            false,
+            script.to_str().expect("script path"),
+            tx,
+            CancelHandle::default(),
+        )
+        .await
+        .expect("apply");
+        let _ = drain(&mut rx).await;
+
+        assert!(!outcome.success);
+        assert!(!outcome.cancelled);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("error: failed to commit transaction (conflicting files)")
+        );
+        assert_eq!(
+            outcome.candidates,
+            vec!["mpv".to_string(), "mpv-old".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_pacman() {
+        let script = fake_pacman(
+            "#!/bin/sh\n\
+             trap 'exit 130' INT TERM\n\
+             echo '(1/2) upgrading linux'\n\
+             sleep 5\n",
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = request(&[]);
+        let cancel = CancelHandle::default();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            canceller.cancel();
+        });
+
+        let outcome = apply_streaming(
+            &request,
+            false,
+            script.to_str().expect("script path"),
+            tx,
+            cancel,
+        )
+        .await
+        .expect("apply");
+        let _ = drain(&mut rx).await;
+
+        assert!(!outcome.success);
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.error.as_deref(), Some("Update cancelled."));
+    }
+
+    fn request(holds: &[&str]) -> ApplyRequest {
+        ApplyRequest {
+            sources: vec![UpdateSource::System],
+            holds: holds.iter().map(|hold| hold.to_string()).collect(),
+        }
+    }
+
+    async fn drain(rx: &mut mpsc::Receiver<ApplyEvent>) -> Vec<ApplyEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn fake_pacman(body: &str) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let directory =
+            std::env::temp_dir().join(format!("skemer-pacman-{}-{id}", std::process::id()));
+        fs::create_dir_all(&directory).expect("temp directory");
+        let path = directory.join("pacman");
+        let mut file = fs::File::create(&path).expect("create fake pacman");
+        file.write_all(body.as_bytes()).expect("write fake pacman");
+        file.sync_all().expect("flush fake pacman");
+        drop(file);
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod");
+        path
     }
 
     #[test]

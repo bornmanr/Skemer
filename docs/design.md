@@ -194,8 +194,9 @@ and suggests starting `skemer-helper`.
 ## 12. Open Implementation Details
 
 - The fixed D-Bus methods are `Check`, `Prepare`, `Apply`, `Cancel`, and
-  `RefreshMirrors`. Progress signals and cancellation land with the streaming
-  phase.
+  `RefreshMirrors`. `Apply` emits `Progress` and `LogLine` signals while it
+  runs, and `Cancel` sends SIGINT to the pacman process group. Only the user
+  that started the update may cancel it.
 - Flatpak column parsing and installed-version lookup.
 - Theme loader format (CSS variables + a small theme manifest).
 - Log retention and copy-log behavior.

@@ -1,6 +1,7 @@
 import "./style.css";
 import {
   applyUpdates,
+  cancelUpdates,
   checkUpdates,
   DEFAULT_SETTINGS,
   isTauri,
@@ -10,6 +11,7 @@ import {
 import {
   formatBytes,
   sourceLabel,
+  type ApplyOutcome,
   type Settings,
   type UpdateItem,
   type UpdatePlan,
@@ -24,7 +26,13 @@ interface State {
   settings: Settings;
   loading: boolean;
   error: string | null;
+  notice: string | null;
   settingsOpen: boolean;
+  applying: boolean;
+  cancelRequested: boolean;
+  progress: number;
+  progressMessage: string;
+  log: string[];
 }
 
 const state: State = {
@@ -35,7 +43,13 @@ const state: State = {
   settings: DEFAULT_SETTINGS,
   loading: false,
   error: null,
+  notice: null,
   settingsOpen: false,
+  applying: false,
+  cancelRequested: false,
+  progress: 0,
+  progressMessage: "Preparing transaction…",
+  log: [],
 };
 
 const appElement = document.querySelector<HTMLDivElement>("#app");
@@ -70,6 +84,50 @@ function currentDetail(): UpdateItem | undefined {
   return items.find((item) => item.id === state.detail) ?? itemsFor(state.active)[0];
 }
 
+let renderQueued = false;
+
+function scheduleRender(): void {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    render();
+  });
+}
+
+function logLineClass(line: string): string {
+  const lower = line.toLowerCase();
+  if (lower.includes("error:") || lower.includes("failed")) return "err";
+  if (lower.includes("warning:")) return "warn";
+  if (line.startsWith("::")) return "ok";
+  return "";
+}
+
+function progressView(): string {
+  const lines = state.log.slice(-200);
+  return `
+    <section class="panel progress-panel">
+      <div class="progress-head">
+        <div>
+          <h2>Updating the system</h2>
+          <p>Do not power off the system during the update.</p>
+        </div>
+        <span class="chip progress-chip">${state.progress}%</span>
+      </div>
+      <div class="bar"><i style="width:${state.progress}%"></i></div>
+      <div class="progress-meta">
+        <span>${escapeHtml(state.progressMessage || "Preparing transaction…")}</span>
+        <span>${state.progress}%</span>
+      </div>
+      <div class="log" id="update-log">${lines
+        .map((line) => `<span class="${logLineClass(line)}">${escapeHtml(line)}</span>`)
+        .join("\n")}</div>
+      <div class="progress-actions">
+        <button class="btn ghost" id="cancel" ${state.cancelRequested ? "disabled" : ""}>${state.cancelRequested ? "Cancelling…" : "Cancel"}</button>
+      </div>
+    </section>`;
+}
+
 function render(): void {
   const selected = selectedItems();
   const total = selected.reduce((sum, item) => sum + item.download_bytes, 0);
@@ -84,14 +142,15 @@ function render(): void {
           <p>${state.plan ? `Last checked <b>${escapeHtml(state.plan.checked_at)}</b>` : "Veldmuis updater"}</p>
         </div>
         <div class="header-actions">
-          <button class="btn ghost" id="settings" title="Settings">Settings</button>
-          <button class="btn" id="check" ${state.loading ? "disabled" : ""}>${state.loading ? "Checking…" : "Check for updates"}</button>
+          <button class="btn ghost" id="settings" title="Settings" ${state.applying ? "disabled" : ""}>Settings</button>
+          <button class="btn" id="check" ${state.loading || state.applying ? "disabled" : ""}>${state.loading ? "Checking…" : "Check for updates"}</button>
         </div>
       </header>
 
       ${state.error ? `<div class="banner error">${escapeHtml(state.error)}</div>` : ""}
+      ${state.notice ? `<div class="banner success">${escapeHtml(state.notice)}</div>` : ""}
 
-      <section class="summary">
+      <section class="summary ${state.applying ? "hidden" : ""}">
         <div class="count">${selected.length}</div>
         <div class="summary-text">
           <strong>${selected.length === 0 ? "No selected updates" : "updates selected"}</strong>
@@ -103,7 +162,7 @@ function render(): void {
         </div>
       </section>
 
-      <nav class="tabs">
+      <nav class="tabs ${state.applying ? "hidden" : ""}">
         ${(["system", "flatpak-system", "flatpak-user"] as UpdateSource[])
           .map(
             (source) => `
@@ -114,7 +173,7 @@ function render(): void {
           .join("")}
       </nav>
 
-      <section class="workspace">
+      <section class="workspace ${state.applying ? "hidden" : ""}">
         <div class="panel list-panel">
           <div class="list-head">
             <label class="source-toggle">
@@ -166,6 +225,8 @@ function render(): void {
         </aside>
       </section>
 
+      ${state.applying ? progressView() : ""}
+
       <footer class="footer">
         <span class="muted">${isTauri ? "Skemer is running natively." : "Browser preview with sample data."}</span>
         <span class="spacer"></span>
@@ -173,7 +234,7 @@ function render(): void {
       </footer>
 
       ${
-        state.settingsOpen
+        state.settingsOpen && !state.applying
           ? `
             <section class="settings panel">
               <h2>Settings</h2>
@@ -202,11 +263,20 @@ function render(): void {
     </div>`;
 
   wire();
+
+  if (state.applying) {
+    const logElement = document.querySelector<HTMLDivElement>("#update-log");
+    if (logElement) logElement.scrollTop = logElement.scrollHeight;
+  }
 }
 
 function wire(): void {
-  document.querySelector("#check")?.addEventListener("click", () => void refresh());
+  document.querySelector("#check")?.addEventListener("click", () => {
+    state.notice = null;
+    void refresh();
+  });
   document.querySelector("#update")?.addEventListener("click", () => void apply());
+  document.querySelector("#cancel")?.addEventListener("click", () => void cancel());
   document.querySelector("#settings")?.addEventListener("click", () => {
     state.settingsOpen = !state.settingsOpen;
     render();
@@ -258,24 +328,68 @@ async function refresh(): Promise<void> {
 }
 
 async function apply(): Promise<void> {
-  state.loading = true;
-  state.error = null;
-  render();
   const sources = [...state.selected].filter((source) => sourceCount(source) > 0);
+  if (sources.length === 0) return;
+
+  state.applying = true;
+  state.cancelRequested = false;
+  state.progress = 0;
+  state.progressMessage = "Preparing transaction…";
+  state.log = [];
+  state.error = null;
+  state.notice = null;
+  render();
+
   try {
-    const outcome = await applyUpdates(sources, []);
-    if (!outcome.success) {
+    const outcome: ApplyOutcome = await applyUpdates(sources, []);
+    state.applying = false;
+    if (outcome.cancelled) {
+      state.notice = "Update cancelled.";
+    } else if (!outcome.success) {
       state.error = outcome.error ?? "The update did not complete.";
+    } else {
+      state.notice = "Update complete.";
     }
   } catch (error) {
+    state.applying = false;
     state.error = String(error);
-  } finally {
-    state.loading = false;
-    render();
   }
+
+  render();
   if (!state.error) {
     await refresh();
   }
+}
+
+async function cancel(): Promise<void> {
+  if (state.cancelRequested) return;
+  state.cancelRequested = true;
+  state.progressMessage = "Cancelling…";
+  render();
+  try {
+    await cancelUpdates();
+  } catch (error) {
+    state.error = String(error);
+    render();
+  }
+}
+
+async function subscribeToUpdates(): Promise<void> {
+  if (!isTauri) return;
+  const { listen } = await import("@tauri-apps/api/event");
+  await listen<{ percent: number; message: string }>("skemer://update-progress", (event) => {
+    const percent = Number(event.payload.percent);
+    state.progress = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+    state.progressMessage = event.payload.message;
+    scheduleRender();
+  });
+  await listen<{ line: string }>("skemer://update-log", (event) => {
+    state.log.push(event.payload.line);
+    if (state.log.length > 400) {
+      state.log.splice(0, state.log.length - 400);
+    }
+    scheduleRender();
+  });
 }
 
 async function saveSettingsFromForm(): Promise<void> {
@@ -307,6 +421,11 @@ async function saveSettingsFromForm(): Promise<void> {
 void (async () => {
   try {
     state.settings = await loadSettings();
+  } catch (error) {
+    state.error = String(error);
+  }
+  try {
+    await subscribeToUpdates();
   } catch (error) {
     state.error = String(error);
   }
