@@ -1,0 +1,21 @@
+[Unit]
+Description=Skemer privileged update helper
+Documentation=https://github.com/ruannnebornman/Skemer
+
+[Service]
+Type=dbus
+BusName=org.veldmuislinux.skemer
+ExecStart=/usr/lib/skemer/skemer-helper
+
+# pacman needs broad filesystem write access, so ProtectSystem=strict is not
+# possible. Keep the rest of the sandbox conservative.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

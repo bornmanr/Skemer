@@ -1,0 +1,4 @@
+{"dir":"ui","frame":{"type":"check","sources":["system","flatpak-system","flatpak-user"]}}
+{"dir":"helper","frame":{"type":"plan","items":[],"total_download_bytes":0,"reboot_suggested":false,"checked_at":"","warnings":[],"held_packages":[]}}
+{"dir":"ui","frame":{"type":"apply","sources":["system"],"holds":[]}}
+{"dir":"helper","frame":{"type":"finished","success":true,"held_packages":[],"reboot_suggested":false,"log_tail":""}}

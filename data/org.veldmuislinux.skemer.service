@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.veldmuislinux.skemer
+Exec=/usr/lib/skemer/skemer-helper
+SystemdService=skemer-helper.service
