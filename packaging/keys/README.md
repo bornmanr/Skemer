@@ -19,10 +19,24 @@ They are not generated automatically. Create them once, verify them, and commit
 only the public material.
 
 For a guided setup, run `packaging/setup-release-key.sh` from a terminal. It
-generates or reuses the key, writes the public files into the Skemer and
-Veldmuis checkouts, exports the secret material outside both repositories, and
-optionally sets the GitHub release environment secrets. It never commits or
-pushes.
+uses an isolated keyring, asks you for the passphrase (it does not generate
+one), writes:
+
+```text
+backup/skemer-release-full-secret.asc   full secret, offline
+backup/skemer-release-revoke.asc        revocation certificate, offline
+github/SKEMER_GPG_PRIVATE_KEY.asc       signing subkey, GitHub secret
+github/SKEMER_GPG_PASSPHRASE            passphrase, GitHub secret
+github/SKEMER_GPG_FPR                   fingerprint, GitHub secret
+public/skemer-release.gpg/.asc          public key material
+public/skemer-trusted                   public fingerprint
+```
+
+It also creates a zip containing only the two offline backup files and a
+README, so the passphrase can stay separate. It verifies the full secret and
+the signing subkey before finishing, writes the public files into both
+checkouts, and optionally sets the GitHub release environment secrets. It never
+commits or pushes.
 
 ## Create the key
 
