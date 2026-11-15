@@ -7,7 +7,7 @@
   <vendor_url>https://veldmuislinux.org/</vendor_url>
 
   <action id="org.veldmuislinux.skemer.apply">
-    <description>Update the system</description>
+    <description>Update the system and Flatpak system apps</description>
     <message>Authentication is required to update the system</message>
     <icon_name>skemer</icon_name>
     <defaults>

@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use skemer_core::models::{ApplyOutcome, ApplyRequest};
+use skemer_core::models::{ApplyOutcome, ApplyRequest, UpdateSource};
+use skemer_core::CancelHandle;
 use tokio::sync::mpsc;
 use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
@@ -18,7 +19,7 @@ pub struct SkemerService {
 }
 
 struct RunningJob {
-    cancel: system::CancelHandle,
+    cancel: CancelHandle,
     uid: u32,
 }
 
@@ -94,7 +95,7 @@ impl SkemerService {
 
         // Register the cancel handle before waiting for the transaction lock so
         // a second apply is rejected immediately.
-        let cancel = system::CancelHandle::default();
+        let cancel = CancelHandle::default();
         {
             let mut running = self
                 .running
@@ -116,22 +117,27 @@ impl SkemerService {
 
         let _guard = self.transaction_lock.lock().await;
 
-        // Holds are validated before pacman starts. A rejected hold is a hard
-        // error; the UI asks for confirmation and calls Prepare first.
-        let holds = request.holds.clone();
-        let decision = tokio::task::spawn_blocking(move || system::prepare(&holds))
-            .await
-            .map_err(failed)?
-            .map_err(failed)?;
-        if !decision.safe {
-            return Err(fdo::Error::Failed(decision.reason));
-        }
+        let wants_system = request.sources.contains(&UpdateSource::System);
+        let mut reboot_suggested = false;
 
-        let reboot_suggested = tokio::task::spawn_blocking(system::check)
-            .await
-            .map_err(failed)?
-            .map(|plan| plan.reboot_suggested)
-            .unwrap_or(false);
+        if wants_system {
+            // Holds are validated before pacman starts. A rejected hold is a
+            // hard error; the UI asks for confirmation and calls Prepare first.
+            let holds = request.holds.clone();
+            let decision = tokio::task::spawn_blocking(move || system::prepare(&holds))
+                .await
+                .map_err(failed)?
+                .map_err(failed)?;
+            if !decision.safe {
+                return Err(fdo::Error::Failed(decision.reason));
+            }
+
+            reboot_suggested = tokio::task::spawn_blocking(system::check)
+                .await
+                .map_err(failed)?
+                .map(|plan| plan.reboot_suggested)
+                .unwrap_or(false);
+        }
 
         let (events_tx, mut events_rx) = mpsc::channel::<system::ApplyEvent>(256);
         let emitter = emitter.to_owned();
@@ -148,8 +154,15 @@ impl SkemerService {
             }
         });
 
-        let result =
-            system::apply_streaming(&request, reboot_suggested, "pacman", events_tx, cancel).await;
+        let result = system::apply_streaming(
+            &request,
+            reboot_suggested,
+            "pacman",
+            "flatpak",
+            events_tx,
+            cancel,
+        )
+        .await;
 
         // Flush the log/progress signals before returning the outcome.
         let _ = forwarder.await;

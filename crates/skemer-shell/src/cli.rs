@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use skemer_core::UpdatePlan;
+use skemer_core::{Settings, UpdatePlan};
 
 use crate::helper;
 
@@ -51,8 +51,13 @@ pub fn try_run() -> bool {
 
 fn run_check(arguments: Vec<String>) {
     let json = arguments.iter().any(|argument| argument == "--json");
+    let settings = Settings::load().unwrap_or_default();
     match helper::check_blocking() {
-        Ok(plan) => print_plan(&plan, json),
+        Ok(mut plan) => {
+            let warnings = crate::flatpak::add_flatpak(&mut plan, &settings);
+            plan.warnings.extend(warnings);
+            print_plan(&plan, json);
+        }
         Err(error) => {
             eprintln!("skemer: {error:#}");
             eprintln!(

@@ -197,7 +197,8 @@ and suggests starting `skemer-helper`.
   `RefreshMirrors`. `Apply` emits `Progress` and `LogLine` signals while it
   runs, and `Cancel` sends SIGINT to the pacman process group. Only the user
   that started the update may cancel it.
-- Flatpak column parsing and installed-version lookup.
+- Flatpak runtime version display when the remote does not expose a version;
+  the branch is shown in the summary today.
 - Theme loader format (CSS variables + a small theme manifest).
 - Log retention and copy-log behavior.
 - Tray menu copy and icon states.

@@ -113,6 +113,19 @@ pub fn parse_progress(line: &str) -> Option<(u32, String)> {
     Some((current * 100 / total, message.to_string()))
 }
 
+/// Pick the most useful error line from a command log.
+pub fn failure_message(log: &str) -> String {
+    log.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("error:") || line.contains("failed")
+        })
+        .unwrap_or("the update failed")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
