@@ -186,7 +186,7 @@ main() {
 
   local existing_fpr fpr
   existing_fpr="$(gpgc --list-secret-keys --with-colons "${uid}" 2>/dev/null \
-    | awk -F: '$1 == "fpr" { print $10; exit }')"
+    | awk -F: '$1 == "fpr" { print $10; exit }' || true)"
 
   if [[ -n "${existing_fpr}" ]]; then
     log "Found an existing Skemer release key:"
