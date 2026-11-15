@@ -184,7 +184,7 @@ main() {
   mkdir -p "${outdir}/backup" "${outdir}/github" "${outdir}/public"
   chmod 700 "${outdir}/backup" "${outdir}/github"
 
-  local existing_fpr fpr
+  local existing_fpr fpr=""
   existing_fpr="$(gpgc --list-secret-keys --with-colons "${uid}" 2>/dev/null \
     | awk -F: '$1 == "fpr" { print $10; exit }' || true)"
 
